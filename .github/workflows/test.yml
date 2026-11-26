@@ -1,0 +1,87 @@
+name: Core CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core:
+    name: Build and test Novu core
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CYPRESS_INSTALL_BINARY: '0'
+      HUSKY: '0'
+      NEW_RELIC_ENABLED: 'false'
+      NX_DAEMON: 'false'
+      NX_NO_CLOUD: 'true'
+      TZ: UTC
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+
+      - uses: pnpm/action-setup@v6
+
+      - name: Install pinned dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build API, worker, and SDKs
+        run: >-
+          pnpm --filter '@novu/api...' --filter '@novu/worker...'
+          --filter '@novu/node...' --filter '@novu/stateless...'
+          --workspace-concurrency=2 run build
+
+      - name: Test Node SDK and stateless engine
+        run: |
+          # Axios must send the SDK fixture requests through Nock's HTTP mock.
+          test_no_proxy="${no_proxy:-${NO_PROXY:-}}"
+          export no_proxy="${test_no_proxy:+$test_no_proxy,}example.com"
+          export NO_PROXY="$no_proxy"
+          pnpm --filter @novu/node --filter @novu/stateless run test:unit --runInBand
+
+      - name: Test API payloads, templates, and request parsing
+        env:
+          NODE_ENV: test
+          TS_NODE_COMPILER_OPTIONS: '{"strictNullChecks": false}'
+        run: >-
+          pnpm --filter @novu/api exec mocha --no-config
+          --require reflect-metadata --require ts-node/register
+          src/app/message-template/shared/sanitizer.service.spec.ts
+          src/app/shared/helpers/content.service.spec.ts
+          src/app/events/usecases/verify-payload/verify-payload.spec.ts
+          src/app/shared/transformers/to-boolean.spec.ts
+          src/app/widgets/pipes/limit-pipe/limit-pipe.spec.ts
+
+      - name: Test worker workflow conditions
+        env:
+          NODE_ENV: test
+          TS_NODE_COMPILER_OPTIONS: '{"strictNullChecks": false}'
+        run: |
+          # Keep the upstream Sinon cleanup without starting the integration services.
+          worker_test_hooks="$(mktemp --suffix=.cjs)"
+          trap 'rm -f "$worker_test_hooks"' EXIT
+          cat > "$worker_test_hooks" <<'HOOK'
+          const { createRequire } = require('node:module');
+          const sinon = createRequire(process.cwd() + '/package.json')('sinon');
+          exports.mochaHooks = { afterEach: () => sinon.restore() };
+          HOOK
+          pnpm --filter @novu/worker exec mocha --no-config \
+            --require reflect-metadata --require ts-node/register \
+            --require "$worker_test_hooks" src/app/workflow/specs/conditions-filter.usecase.spec.ts
